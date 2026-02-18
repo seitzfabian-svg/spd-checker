@@ -1,19 +1,18 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import os
 import json
 import streamlit as st
 
 from src.parser import parse_document
 from src.retrieval import build_retriever, retrieve_top_chunks
 from src.llm import decide_with_llm
-from src.render import render_decision_badge, render_sources
+from src.render import render_decision_badge, render_evidence
+from src.schema import DecisionOut
 
 st.set_page_config(page_title="SPD Prozess-Checker", layout="wide")
-
-st.title("SPD Prozess-Checker (Doc-grounded)")
-st.caption("Entscheidung basiert ausschließlich auf der hochgeladenen SPD-Dokumentation. Fehlt Evidenz → Manuelle Prüfung.")
+st.title("SPD Prozess-Checker (Machbarkeitsprüfung)")
+st.caption("Entscheidung ausschließlich aus der SPD-Prozessbeschreibung (Inputs/DWH/Rules). Sonst → Manuelle Prüfung.")
 
 # ----------------------------
 # Session State
@@ -26,14 +25,13 @@ if "chunks" not in st.session_state:
     st.session_state.chunks = None
 if "result" not in st.session_state:
     st.session_state.result = None
+if "evidence" not in st.session_state:
+    st.session_state.evidence = None
 
-# ----------------------------
-# UI Layout
-# ----------------------------
 col_left, col_right = st.columns([0.48, 0.52], gap="large")
 
 with col_left:
-    st.header("1) SPD-Dokument hochladen")
+    st.header("1) SPD-Prozessbeschreibung hochladen")
     uploaded = st.file_uploader("PDF oder TXT", type=["pdf", "txt"])
 
     if uploaded:
@@ -46,7 +44,6 @@ with col_left:
             st.session_state.chunks = chunks
 
             st.success(f"Dokument verarbeitet. Zeichen: {len(text):,} | Chunks: {len(chunks)}")
-
             with st.expander("Vorschau (erste 2.000 Zeichen)"):
                 st.text(text[:2000])
 
@@ -73,11 +70,12 @@ with col_left:
             extAbweichenderKontoinhaber = st.text_input("extAbweichenderKontoinhaber", value="")
 
         st.divider()
-        st.subheader("DWH-Abfrage (optional)")
+        st.subheader("DWH-Abfrage (Input)")
+
         dwh_prev_treatment = st.radio(
             "Gab es bereits eine vorherige Behandlung?",
-            ["Unklar", "Ja", "Nein"],
-            index=0,
+            ["Ja", "Nein"],
+            index=1,
             horizontal=True
         )
         dwh_total_refunded = st.number_input(
@@ -91,35 +89,38 @@ with col_left:
 
     if submit:
         if not st.session_state.retriever:
-            st.error("Bitte zuerst eine SPD-Dokumentation hochladen.")
+            st.error("Bitte zuerst eine SPD-Prozessbeschreibung hochladen.")
         else:
             inputs = {
                 "extOrdnungsbegriff": extOrdnungsbegriff,
                 "extLeistungsangebot": extLeistungsangebot,
-                "extRechnungsbetrag": extRechnungsbetrag,
+                "extRechnungsbetrag": float(extRechnungsbetrag),
                 "extRechnungsdatum": extRechnungsdatum,
                 "extIBAN": extIBAN,
-                "extBVEinmaligkeit": extBVEinmaligkeit,
+                "extBVEinmaligkeit": bool(extBVEinmaligkeit),
                 "sysQueueSelectorName": sysQueueSelectorName,
                 "sysExternalId": sysExternalId,
                 "extAbweichenderKontoinhaber": extAbweichenderKontoinhaber,
                 "dwh": {
-                    "previous_treatment": dwh_prev_treatment,  # "Ja" | "Nein" | "Unklar"
-                    "total_refunded_eur": dwh_total_refunded
+                    "previous_treatment": True if dwh_prev_treatment == "Ja" else False,
+                    "total_refunded_eur": float(dwh_total_refunded)
                 }
             }
 
             evidence = retrieve_top_chunks(
                 st.session_state.retriever,
                 st.session_state.chunks,
-                json.dumps(inputs, ensure_ascii=False),
+                query=json.dumps(inputs, ensure_ascii=False),
                 top_k=6
             )
 
-            with st.spinner("Entscheidung wird geprüft (doc-grounded) ..."):
+            with st.spinner("Prüfung läuft (strikt dokumentbasiert) ..."):
                 try:
-                    result = decide_with_llm(inputs, evidence)
+                    out_json, debug = decide_with_llm(inputs, evidence)
+                    # pydantic validate
+                    result = DecisionOut.model_validate(out_json).model_dump()
                     st.session_state.result = result
+                    st.session_state.evidence = debug
                 except Exception as e:
                     st.error(f"LLM-Entscheidung fehlgeschlagen: {e}")
 
@@ -129,16 +130,18 @@ with col_right:
     if st.session_state.result is None:
         st.info("Noch keine Prüfung ausgeführt.")
     else:
-        render_decision_badge(st.session_state.result.get("decision", "Manuelle Prüfung"))
+        render_decision_badge(st.session_state.result["Genehmigung"])
 
-        st.subheader("Begründung")
-        st.write(st.session_state.result.get("rationale", ""))
+        st.subheader("Outputvariablen")
+        st.write(f"**Genehmigung:** {st.session_state.result['Genehmigung']}")
+        st.write(f"**Genehmigungsbetrag:** {st.session_state.result['Genehmigungsbetrag']}")
+        st.write(f"**Empfehlung:** {st.session_state.result['Empfehlung']}")
 
-        st.subheader("Referenzen / Evidenz")
-        render_sources(st.session_state.result.get("evidence", []))
+        st.subheader("Evidenz / Referenzen (Top-Chunks)")
+        render_evidence(st.session_state.evidence)
 
         st.subheader("JSON")
-        st.json(st.session_state.result)
+        st.code(json.dumps(st.session_state.result, ensure_ascii=False, indent=2), language="json")
 
         st.download_button(
             "JSON herunterladen",
